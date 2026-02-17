@@ -1,38 +1,13 @@
 // app/api/sign-pdf/route.js
 // App Router API handler — POST /api/sign-pdf
+// Uses Vercel Blob for storage (no local filesystem writes)
 
 import { NextResponse } from "next/server";
 import { PDFDocument, rgb } from "pdf-lib";
-import { writeFile, unlink, readdir, stat } from "fs/promises";
-import { existsSync, mkdirSync } from "fs";
-import path from "path";
+import { put } from "@vercel/blob";
 import crypto from "crypto";
 
-// ── Draft directory setup ────────────────────────────────────────────────────
-const DRAFT_DIR = path.join(process.cwd(), ".drafts");
-if (!existsSync(DRAFT_DIR)) mkdirSync(DRAFT_DIR, { recursive: true });
-
 const TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-async function scheduleDeletion(filePath) {
-  setTimeout(async () => {
-    try { await unlink(filePath); } catch {}
-  }, TTL_MS);
-}
-
-async function cleanStaleDrafts() {
-  try {
-    const files = await readdir(DRAFT_DIR);
-    const cutoff = Date.now() - TTL_MS;
-    await Promise.all(
-      files.map(async (f) => {
-        const fp = path.join(DRAFT_DIR, f);
-        const { mtimeMs } = await stat(fp);
-        if (mtimeMs < cutoff) await unlink(fp).catch(() => {});
-      })
-    );
-  } catch {}
-}
 
 // ── Parse page ranges like "1,3,5-7" → 0-indexed array ────────────────────
 function parsePages(mode, custom, total) {
@@ -41,34 +16,38 @@ function parsePages(mode, custom, total) {
   if (mode === "custom") {
     const set = new Set();
     custom.split(",").forEach((part) => {
-      const [a, b] = part.trim().split("-").map(Number);
-      if (!isNaN(a) && !isNaN(b)) {
-        for (let i = a; i <= b; i++) set.add(i - 1);
-      } else if (!isNaN(a)) {
-        set.add(a - 1);
+      const trimmed = part.trim();
+      const dashIdx = trimmed.indexOf("-");
+      if (dashIdx > 0) {
+        const a = Number(trimmed.slice(0, dashIdx));
+        const b = Number(trimmed.slice(dashIdx + 1));
+        if (!isNaN(a) && !isNaN(b))
+          for (let i = a; i <= b; i++) set.add(i - 1);
+      } else {
+        const n = Number(trimmed);
+        if (!isNaN(n) && n > 0) set.add(n - 1);
       }
     });
-    return [...set].filter((i) => i >= 0 && i < total);
+    return [...set].filter((i) => i >= 0 && i < total).sort((a, b) => a - b);
   }
   return [total - 1];
 }
 
 // ── Draw signature at the correct position ──────────────────────────────────
 function drawSignature(page, embed, placement, corner, sizePct) {
-  const { width: pw, height: ph } = page.getSize();
-  const sigW = (sizePct / 100) * pw;
-  const sigH = sigW * (embed.height / embed.width);
+  const { width: pw } = page.getSize();
+  const sigW   = (sizePct / 100) * pw;
+  const sigH   = sigW * (embed.height / embed.width);
   const margin = 24;
 
   if (placement === "keyword") {
-    // Center-bottom
     page.drawImage(embed, { x: pw / 2 - sigW / 2, y: margin, width: sigW, height: sigH });
     return;
   }
 
   if (corner === "bottom-both") {
-    page.drawImage(embed, { x: margin, y: margin, width: sigW, height: sigH });
-    page.drawImage(embed, { x: pw - margin - sigW, y: margin, width: sigW, height: sigH });
+    page.drawImage(embed, { x: margin,              y: margin, width: sigW, height: sigH });
+    page.drawImage(embed, { x: pw - margin - sigW,  y: margin, width: sigW, height: sigH });
     return;
   }
 
@@ -80,21 +59,17 @@ function drawSignature(page, embed, placement, corner, sizePct) {
 function addWatermark(page) {
   const { width, height } = page.getSize();
   page.drawText("PREVIEW ONLY", {
-    x: width / 2 - 100,
-    y: height / 2,
-    size: 44,
-    color: rgb(0.96, 0.62, 0.04),
+    x:       width / 2 - 100,
+    y:       height / 2,
+    size:    44,
+    color:   rgb(0.96, 0.62, 0.04),
     opacity: 0.18,
-    rotate: { type: "degrees", angle: -45 },
+    rotate:  { type: "degrees", angle: -45 },
   });
 }
 
 // ── Route handler ────────────────────────────────────────────────────────────
 export async function POST(request) {
-  await cleanStaleDrafts();
-
-  let pdfTmp, sigTmp;
-
   try {
     const form = await request.formData();
 
@@ -105,18 +80,9 @@ export async function POST(request) {
       return NextResponse.json({ error: "Missing pdf or sig file" }, { status: 400 });
     }
 
-    // Save uploads to .drafts
-    const uid = crypto.randomUUID();
-    pdfTmp = path.join(DRAFT_DIR, `${uid}_input.pdf`);
-    sigTmp = path.join(DRAFT_DIR, `${uid}_sig`);
-
+    // Read uploads into memory buffers — no disk writes needed
     const pdfBuf = Buffer.from(await pdfFile.arrayBuffer());
     const sigBuf = Buffer.from(await sigFile.arrayBuffer());
-
-    await writeFile(pdfTmp, pdfBuf);
-    await writeFile(sigTmp, sigBuf);
-    scheduleDeletion(pdfTmp);
-    scheduleDeletion(sigTmp);
 
     // Config
     const placement   = form.get("placement")   || "corners";
@@ -126,12 +92,14 @@ export async function POST(request) {
     const sizePct     = Number(form.get("size")) || 20;
     const isPreview   = form.get("preview") === "true";
 
-    // Build PDF
-    const pdfDoc   = await PDFDocument.load(pdfBuf);
-    const total    = pdfDoc.getPageCount();
-    const isPng    = sigBuf[0] === 0x89 && sigBuf[1] === 0x50;
-    const embed    = isPng ? await pdfDoc.embedPng(sigBuf) : await pdfDoc.embedJpg(sigBuf);
-    const targets  = parsePages(pages, customPages, total);
+    // ── Build signed PDF in memory ──────────────────────────────────────────
+    const pdfDoc  = await PDFDocument.load(pdfBuf);
+    const total   = pdfDoc.getPageCount();
+    const isPng   = sigBuf[0] === 0x89 && sigBuf[1] === 0x50;
+    const embed   = isPng
+      ? await pdfDoc.embedPng(sigBuf)
+      : await pdfDoc.embedJpg(sigBuf);
+    const targets = parsePages(pages, customPages, total);
 
     for (const idx of targets) {
       const page = pdfDoc.getPage(idx);
@@ -141,22 +109,36 @@ export async function POST(request) {
 
     const outBytes = await pdfDoc.save();
 
-    // Save output draft
-    const outPath = path.join(DRAFT_DIR, `${uid}_output.pdf`);
-    await writeFile(outPath, outBytes);
-    scheduleDeletion(outPath);
+    // ── Upload to Vercel Blob ───────────────────────────────────────────────
+    // Files are stored under signed/ or preview/ prefix for easy cleanup.
+    // The unique ID prevents collisions between concurrent requests.
+    const uid    = crypto.randomUUID();
+    const prefix = isPreview ? "preview" : "signed";
+    const blob   = await put(
+      `${prefix}/${uid}.pdf`,
+      outBytes,
+      {
+        access:      "public",            // user needs a URL to download
+        contentType: "application/pdf",
+        addRandomSuffix: false,           // uid already guarantees uniqueness
+      }
+    );
 
-    const prefix = isPreview ? "preview_" : "signed_";
-    return new NextResponse(outBytes, {
-      status: 200,
-      headers: {
-        "Content-Type": "application/pdf",
-        "Content-Disposition": `attachment; filename="${prefix}document.pdf"`,
-        "X-Draft-Expires": new Date(Date.now() + TTL_MS).toISOString(),
-      },
+    // Return the blob URL + expiry metadata to the client.
+    // DownloadPanel fetches this URL directly for the download.
+    const expiresAt = new Date(Date.now() + TTL_MS).toISOString();
+    return NextResponse.json({
+      url:        blob.url,       // e.g. https://xxxx.public.blob.vercel-storage.com/signed/uuid.pdf
+      blobUrl:    blob.url,       // alias kept for clarity
+      filename:   `${prefix}_document.pdf`,
+      expiresAt,
     });
+
   } catch (err) {
     console.error("[sign-pdf]", err);
-    return NextResponse.json({ error: "PDF processing failed", detail: err.message }, { status: 500 });
+    return NextResponse.json(
+      { error: "PDF processing failed", detail: err.message },
+      { status: 500 }
+    );
   }
 }

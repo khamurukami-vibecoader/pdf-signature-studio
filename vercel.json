@@ -1,0 +1,13 @@
+{
+  "crons": [
+    {
+      "path": "/api/cleanup",
+      "schedule": "0 0 * * *"
+    }
+  ],
+  "functions": {
+    "app/api/sign-pdf/route.js": {
+      "maxDuration": 30
+    }
+  }
+}

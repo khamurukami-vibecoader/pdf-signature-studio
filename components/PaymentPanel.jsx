@@ -1,59 +1,107 @@
 "use client";
 
-import { useEffect, useState } from "react";
+// Real implementation: creates Razorpay order on mount, polls for confirmation.
+
+import { useEffect, useRef, useState } from "react";
 import UpiQrCode from "./UpiQrCode";
 
-const UPI_ID = process.env.NEXT_PUBLIC_UPI_ID || "merchant@upi";
-const PRICE   = Number(process.env.NEXT_PUBLIC_PRICE) || 49;
-const SESSION_SECONDS = 300; // 5 minutes
+const UPI_ID          = process.env.NEXT_PUBLIC_UPI_ID || "merchant@upi";
+const PRICE           = Number(process.env.NEXT_PUBLIC_PRICE) || 49;
+const POLL_INTERVAL   = 3000;
+const SESSION_SECONDS = 300;
 
 export default function PaymentPanel({ onVerified }) {
-  const [txnId,     setTxnId]     = useState("");
-  const [verifying, setVerifying] = useState(false);
-  const [error,     setError]     = useState("");
-  const [countdown, setCountdown] = useState(SESSION_SECONDS);
-  const [expired,   setExpired]   = useState(false);
+  const [orderId,    setOrderId]    = useState(null);
+  const [loading,    setLoading]    = useState(true);
+  const [error,      setError]      = useState("");
+  const [countdown,  setCountdown]  = useState(SESSION_SECONDS);
+  const [expired,    setExpired]    = useState(false);
+  const [pollStatus, setPollStatus] = useState("waiting");
 
+  const pollRef  = useRef();
+  const timerRef = useRef();
+
+  // 1. Create Razorpay order on mount
   useEffect(() => {
-    const t = setInterval(() => {
+    (async () => {
+      try {
+        const res  = await fetch("/api/create-order", {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({ amount: PRICE }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Order creation failed");
+        setOrderId(data.orderId);
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  // 2. Countdown timer
+  useEffect(() => {
+    timerRef.current = setInterval(() => {
       setCountdown((c) => {
-        if (c <= 1) { setExpired(true); clearInterval(t); return 0; }
+        if (c <= 1) {
+          setExpired(true);
+          clearInterval(timerRef.current);
+          clearInterval(pollRef.current);
+          return 0;
+        }
         return c - 1;
       });
     }, 1000);
-    return () => clearInterval(t);
+    return () => clearInterval(timerRef.current);
   }, []);
+
+  // 3. Poll for payment confirmation
+  useEffect(() => {
+    if (!orderId || expired) return;
+    pollRef.current = setInterval(async () => {
+      try {
+        setPollStatus("verifying");
+        const res  = await fetch(`/api/verify-payment?orderId=${orderId}`);
+        const data = await res.json();
+        if (data.paid) {
+          setPollStatus("paid");
+          clearInterval(pollRef.current);
+          clearInterval(timerRef.current);
+          onVerified(orderId);
+        } else {
+          setPollStatus("waiting");
+        }
+      } catch {
+        setPollStatus("waiting");
+      }
+    }, POLL_INTERVAL);
+    return () => clearInterval(pollRef.current);
+  }, [orderId, expired, onVerified]);
 
   const mm = String(Math.floor(countdown / 60)).padStart(2, "0");
   const ss = String(countdown % 60).padStart(2, "0");
 
-  const handleVerify = async () => {
-    const id = txnId.trim();
-    if (!id) { setError("Please enter your UPI transaction ID."); return; }
-    setError("");
-    setVerifying(true);
+  if (loading) return (
+    <div className="flex flex-col items-center gap-4 py-12">
+      <span className="w-8 h-8 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
+      <p className="text-slate-500 text-sm">Creating secure payment session…</p>
+    </div>
+  );
 
-    // --- Replace with real backend verification ---
-    // const res = await fetch("/api/verify-payment", {
-    //   method: "POST",
-    //   body: JSON.stringify({ txnId: id }),
-    //   headers: { "Content-Type": "application/json" },
-    // });
-    // const data = await res.json();
-    // if (!data.ok) { setError("Payment not found. Try again."); setVerifying(false); return; }
-
-    // Simulated 2-second verification
-    await new Promise((r) => setTimeout(r, 2000));
-    setVerifying(false);
-    onVerified(id);
-  };
+  if (error) return (
+    <div className="text-center py-12">
+      <p className="text-red-400 text-sm mb-4">{error}</p>
+      <button onClick={() => window.location.reload()} className="text-amber-400 text-sm underline">Try again</button>
+    </div>
+  );
 
   return (
     <div className="space-y-6">
-      {/* Order summary */}
       <div className="bg-slate-800/60 rounded-2xl p-5 border border-slate-700">
         <div className="flex justify-between items-center mb-3">
-          <span className="text-slate-400 text-sm font-medium">Session expires in</span>
+          <span className="text-slate-400 text-sm font-medium">QR expires in</span>
           <span className={`font-mono text-lg font-bold ${countdown < 60 ? "text-red-400 animate-pulse" : "text-amber-400"}`}>
             {mm}:{ss}
           </span>
@@ -65,12 +113,8 @@ export default function PaymentPanel({ onVerified }) {
         )}
         <div className="space-y-1.5 text-sm border-t border-slate-700 pt-3">
           <div className="flex justify-between">
-            <span className="text-slate-500">Service</span>
-            <span className="text-slate-300">PDF Signature Overlay</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-slate-500">Processing</span>
-            <span className="text-slate-300">Instant · No watermark</span>
+            <span className="text-slate-500">Order ID</span>
+            <span className="text-slate-400 font-mono text-xs truncate ml-4">{orderId}</span>
           </div>
           <div className="flex justify-between font-semibold">
             <span className="text-slate-400">Total</span>
@@ -79,47 +123,23 @@ export default function PaymentPanel({ onVerified }) {
         </div>
       </div>
 
-      {/* QR code */}
       <UpiQrCode upiId={UPI_ID} amount={PRICE} />
 
-      {/* Transaction ID */}
-      <div>
-        <label className="text-xs uppercase tracking-widest text-slate-500 mb-2 block font-semibold">
-          UPI Transaction / Reference ID
-        </label>
-        <input
-          value={txnId}
-          onChange={(e) => { setTxnId(e.target.value); setError(""); }}
-          placeholder="e.g. 412345678901"
-          disabled={expired || verifying}
-          className="w-full bg-slate-800 border border-slate-600 rounded-xl px-4 py-3
-            text-slate-200 text-sm placeholder-slate-600
-            focus:outline-none focus:border-amber-400 transition-colors
-            disabled:opacity-50 disabled:cursor-not-allowed"
-        />
-        {error && <p className="text-red-400 text-xs mt-2">{error}</p>}
-        <p className="text-xs text-slate-600 mt-2">
-          After payment, copy the UPI reference number from your app receipt
-        </p>
+      <div className="flex items-center justify-center gap-2 text-sm">
+        {pollStatus === "waiting" && (
+          <><span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" /><span className="text-slate-500">Waiting for payment…</span></>
+        )}
+        {pollStatus === "verifying" && (
+          <><span className="w-3 h-3 border border-amber-400 border-t-transparent rounded-full animate-spin" /><span className="text-slate-500">Checking…</span></>
+        )}
+        {pollStatus === "paid" && (
+          <><span className="text-emerald-400">✓</span><span className="text-emerald-400 font-semibold">Payment confirmed! Redirecting…</span></>
+        )}
       </div>
 
-      <button
-        onClick={handleVerify}
-        disabled={!txnId.trim() || verifying || expired}
-        className="w-full py-4 rounded-2xl font-bold text-slate-900 text-sm tracking-wide
-          bg-amber-400 hover:bg-amber-300
-          disabled:opacity-40 disabled:cursor-not-allowed
-          transition-all duration-200 flex items-center justify-center gap-2"
-      >
-        {verifying ? (
-          <>
-            <span className="w-4 h-4 border-2 border-slate-900 border-t-transparent rounded-full animate-spin" />
-            Verifying…
-          </>
-        ) : (
-          "Verify & Unlock Download →"
-        )}
-      </button>
+      <p className="text-xs text-slate-600 text-center">
+        Payment detected automatically · No transaction ID needed
+      </p>
     </div>
   );
 }
