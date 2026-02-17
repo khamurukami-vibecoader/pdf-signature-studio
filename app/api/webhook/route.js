@@ -76,31 +76,30 @@ export async function POST(request) {
 
   switch (event.event) {
 
+    case "payment_link.paid": {
+      // Fired when a Payment Link is fully paid
+      const paymentLink = event.payload.payment_link.entity;
+      const orderId     = paymentLink.id; // e.g. "plink_xxxxxxxx"
+      console.log(`[webhook] Payment link paid: ${orderId} ₹${paymentLink.amount / 100}`);
+      paymentStore.set(orderId, {
+        paid:      true,
+        paidAt:    new Date().toISOString(),
+        amount:    paymentLink.amount / 100,
+      });
+      break;
+    }
+
     case "payment.captured": {
-      // Payment succeeded — mark the order as paid
+      // Also handle direct order payments as fallback
       const payment = event.payload.payment.entity;
-      const orderId = payment.order_id; // e.g. "order_PjHabc123XYZ"
-
-      console.log(`[webhook] Payment captured: orderId=${orderId} amount=₹${payment.amount / 100}`);
-
-      // ── Save to your DB here ──────────────────────────────────────────
-      // Example with Prisma:
-      //   await prisma.order.update({
-      //     where: { id: orderId },
-      //     data:  { status: "paid", paidAt: new Date(), paymentId: payment.id },
-      //   });
-      //
-      // Example with Upstash Redis:
-      //   await redis.set(`order:${orderId}`, JSON.stringify({ paid: true }), { ex: 86400 });
-
-      // In-memory fallback for demo:
+      const orderId = payment.order_id;
+      console.log(`[webhook] Payment captured: orderId=${orderId} ₹${payment.amount / 100}`);
       paymentStore.set(orderId, {
         paid:      true,
         paidAt:    new Date().toISOString(),
         paymentId: payment.id,
         amount:    payment.amount / 100,
       });
-
       break;
     }
 

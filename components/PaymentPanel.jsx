@@ -12,6 +12,7 @@ const SESSION_SECONDS = 300;
 
 export default function PaymentPanel({ onVerified }) {
   const [orderId,    setOrderId]    = useState(null);
+  const [shortUrl,   setShortUrl]   = useState(null);
   const [loading,    setLoading]    = useState(true);
   const [error,      setError]      = useState("");
   const [countdown,  setCountdown]  = useState(SESSION_SECONDS);
@@ -33,6 +34,7 @@ export default function PaymentPanel({ onVerified }) {
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "Order creation failed");
         setOrderId(data.orderId);
+        setShortUrl(data.shortUrl);
       } catch (err) {
         setError(err.message);
       } finally {
@@ -123,7 +125,7 @@ export default function PaymentPanel({ onVerified }) {
         </div>
       </div>
 
-      <UpiQrCode upiId={UPI_ID} amount={PRICE} />
+      <UpiQrCode value={shortUrl} upiId={UPI_ID} amount={PRICE} />
 
       <div className="flex items-center justify-center gap-2 text-sm">
         {pollStatus === "waiting" && (

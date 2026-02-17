@@ -2,14 +2,18 @@
 
 import { QRCodeSVG } from "qrcode.react";
 
-export default function UpiQrCode({ upiId, amount }) {
-  const upiUrl = `upi://pay?pa=${upiId}&pn=SignaturePDF&am=${amount}&cu=INR&tn=PDF+Signature+Service`;
+// value = Razorpay short_url e.g. "https://rzp.io/i/xxxxxxx"
+// This is a real Razorpay-hosted payment page — works with all UPI apps
+// and triggers the webhook when paid.
+export default function UpiQrCode({ value, amount, upiId }) {
+  // Fallback to raw upi:// if no shortUrl yet (during loading)
+  const qrValue = value || `upi://pay?pa=${upiId}&am=${amount}&cu=INR`;
 
   return (
     <div className="flex flex-col items-center gap-3">
       <div className="bg-white p-4 rounded-2xl shadow-xl ring-1 ring-slate-200">
         <QRCodeSVG
-          value={upiUrl}
+          value={qrValue}
           size={180}
           bgColor="#ffffff"
           fgColor="#0f172a"
